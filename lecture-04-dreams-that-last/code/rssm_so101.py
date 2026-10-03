@@ -42,14 +42,19 @@
 # %%
 import os
 import urllib.request
+from pathlib import Path
 
 BASE = ("https://raw.githubusercontent.com/RajatDandekar/"
         "build-a-world-model-from-scratch/main/lecture-04-dreams-that-last/")
+LECTURE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = LECTURE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
 for path in ["data/so101_mini.npz", "data/so101_norm.npz", "data/rssm_so101.pt"]:
-    if not os.path.exists(os.path.basename(path)):
+    destination = DATA_DIR / os.path.basename(path)
+    if not destination.exists():
         print("downloading", path, "...")
-        urllib.request.urlretrieve(BASE + path, os.path.basename(path))
+        urllib.request.urlretrieve(BASE + path, destination)
 print("ready")
 
 # %%
@@ -62,6 +67,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
+
+SHOW_PLOTS = os.getenv("RSSM_SHOW_PLOTS", "0") == "1"
+if not SHOW_PLOTS:
+    plt.show = lambda *args, **kwargs: plt.close("all")
 
 SEED = 0
 np.random.seed(SEED); torch.manual_seed(SEED)
@@ -81,10 +90,10 @@ rcParams.update({
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex",
           "wrist_flex", "wrist_roll", "gripper"]
 
-z = np.load("so101_mini.npz")
+z = np.load(DATA_DIR / "so101_mini.npz")
 EPISODES = [{"frames": z[f"f{i}"], "states": z[f"s{i}"], "actions": z[f"a{i}"]}
             for i in range(int(z["n_episodes"]))]
-norm = np.load("so101_norm.npz")
+norm = np.load(DATA_DIR / "so101_norm.npz")
 S_MEAN, S_STD = norm["s_mean"], norm["s_std"]
 A_MEAN, A_STD = norm["a_mean"], norm["a_std"]
 HOLD_OUT = 4                       # the last 4 episodes are never trained on
@@ -344,9 +353,10 @@ def sample_batch(B=8, L=24):
             torch.tensor(ac).to(device))
 
 
-def train_steps(model, steps=600, B=8, L=24, free_nats=1.0, log_every=100):
+def train_steps(model, steps=100, B=4, L=16, free_nats=1.0, log_every=10,
+                lr=3e-4):
     """One training step = roll the sequence, accumulate both losses, update."""
-    opt = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     history = []
     t_start = time.time()
     for step in range(steps):
@@ -385,13 +395,15 @@ def train_steps(model, steps=600, B=8, L=24, free_nats=1.0, log_every=100):
 
 # A short run so you can watch both losses fall. On a Colab GPU this is ~10 minutes;
 # on CPU it is slow, so we skip it and use the pretrained checkpoint below.
-RUN_TRAINING = torch.cuda.is_available()
+RUN_TRAINING = os.getenv("RSSM_TRAIN_FROM_SCRATCH", "0") == "1"
 if RUN_TRAINING:
-    hist = train_steps(model, steps=600)
+    hist = train_steps(
+        model,
+        steps=int(os.getenv("RSSM_SCRATCH_STEPS", "100")),
+    )
 else:
     hist = None
-    print("no GPU detected — skipping the live training run "
-          "(the pretrained checkpoint below gives the full results)")
+    print("skipping training from scratch")
 
 # %%
 if hist is not None:
@@ -408,16 +420,44 @@ if hist is not None:
 # %% [markdown]
 # ### Load the fully-trained model
 #
-# 600 steps is enough to see the losses move, but the results in the lecture come
+# A short run is enough to see the losses move, but the results in the lecture come
 # from a 21,000-step run on one GPU (about 50 minutes). Let's load that checkpoint
 # and put it through the real tests.
 
 # %%
-ck = torch.load("rssm_so101.pt", map_location=device, weights_only=False)
+ck = torch.load(DATA_DIR / "rssm_so101.pt", map_location=device, weights_only=False)
 model = RSSM().to(device)
 model.load_state_dict(ck)          # the checkpoint is a plain state_dict
-model.eval()
 print("loaded the trained RSSM")
+
+# A low-budget RunPod fine-tune is the default command-line behavior.
+# Override any setting with an environment variable, for example:
+# RSSM_STEPS=50 RSSM_BATCH=2 RSSM_LENGTH=12 python code/rssm_so101.py
+RUN_FINETUNE = os.getenv("RSSM_FINETUNE", "1") == "1"
+if RUN_FINETUNE:
+    ft_steps = int(os.getenv("RSSM_STEPS", "100"))
+    ft_batch = int(os.getenv("RSSM_BATCH", "4"))
+    ft_length = int(os.getenv("RSSM_LENGTH", "16"))
+    ft_lr = float(os.getenv("RSSM_LR", "1e-4"))
+    print(
+        f"fine-tuning: steps={ft_steps}, B={ft_batch}, L={ft_length}, "
+        f"lr={ft_lr:g}, sampled_frames={ft_steps * ft_batch * ft_length:,}"
+    )
+    model.train()
+    train_steps(
+        model,
+        steps=ft_steps,
+        B=ft_batch,
+        L=ft_length,
+        log_every=max(1, ft_steps // 10),
+        lr=ft_lr,
+    )
+    output_path = DATA_DIR / f"rssm_so101_finetuned_{ft_steps}.pt"
+    torch.save(model.state_dict(), output_path)
+    print("saved", output_path)
+    raise SystemExit(0)
+
+model.eval()
 
 # %% [markdown]
 # ## Test 1 · What is the belt actually carrying?
